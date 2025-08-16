@@ -12,10 +12,18 @@
 (define-constant ERR_INVALID_MILESTONE_ORDER (err u110))
 (define-constant ERR_MILESTONE_DEPENDENCIES_NOT_MET (err u111))
 (define-constant ERR_INVALID_DEADLINE (err u112))
+(define-constant ERR_WORK_SESSION_NOT_FOUND (err u113))
+(define-constant ERR_SESSION_ALREADY_ENDED (err u114))
+(define-constant ERR_INVALID_HOURLY_RATE (err u115))
+(define-constant ERR_SESSION_NOT_STARTED (err u116))
+(define-constant ERR_INVOICE_NOT_FOUND (err u117))
+(define-constant ERR_INVALID_TIME_ENTRY (err u118))
 
 (define-data-var next-project-id uint u1)
 (define-data-var next-payment-id uint u1)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-work-session-id uint u1)
+(define-data-var next-invoice-id uint u1)
 
 (define-map projects
   { project-id: uint }
@@ -85,6 +93,55 @@
 (define-map contractor-milestones
   { contractor: principal, milestone-id: uint }
   { assigned: bool }
+)
+
+;; Time tracking and invoicing data structures
+(define-map work-sessions
+  { session-id: uint }
+  {
+    project-id: uint,
+    contractor: principal,
+    task-description: (string-ascii 300),
+    hourly-rate: uint,
+    start-time: uint,
+    end-time: (optional uint),
+    total-hours: (optional uint),
+    billable-amount: (optional uint),
+    status: (string-ascii 20),
+    approved-by: (optional principal),
+    created-at: uint
+  }
+)
+
+(define-map project-hourly-rates
+  { project-id: uint, contractor: principal }
+  { 
+    rate-per-hour: uint,
+    currency: (string-ascii 10),
+    effective-from: uint
+  }
+)
+
+(define-map time-invoices
+  { invoice-id: uint }
+  {
+    project-id: uint,
+    contractor: principal,
+    billing-period-start: uint,
+    billing-period-end: uint,
+    total-hours: uint,
+    total-amount: uint,
+    session-ids: (list 10 uint),
+    status: (string-ascii 20),
+    generated-at: uint,
+    approved-at: (optional uint),
+    paid-at: (optional uint)
+  }
+)
+
+(define-map contractor-sessions
+  { contractor: principal, session-id: uint }
+  { active: bool }
 )
 
 (define-public (create-project (name (string-ascii 100)) (contractor principal) (total-budget uint))
@@ -529,3 +586,290 @@
 (define-read-only (get-next-milestone-id)
   (var-get next-milestone-id)
 )
+
+;; Time tracking and invoicing functions
+(define-public (set-hourly-rate 
+  (project-id uint) 
+  (contractor principal) 
+  (rate-per-hour uint)
+  (currency (string-ascii 10))
+)
+  (let
+    (
+      (project (unwrap! (map-get? projects { project-id: project-id }) ERR_PROJECT_NOT_FOUND))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> rate-per-hour u0) ERR_INVALID_HOURLY_RATE)
+    (map-set project-hourly-rates
+      { project-id: project-id, contractor: contractor }
+      {
+        rate-per-hour: rate-per-hour,
+        currency: currency,
+        effective-from: current-time
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (start-work-session 
+  (project-id uint) 
+  (task-description (string-ascii 300))
+)
+  (let
+    (
+      (session-id (var-get next-work-session-id))
+      (project (unwrap! (map-get? projects { project-id: project-id }) ERR_PROJECT_NOT_FOUND))
+      (rate-info (unwrap! (map-get? project-hourly-rates { project-id: project-id, contractor: tx-sender }) ERR_INVALID_HOURLY_RATE))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    ;; Verify contractor is authorized for this project
+    (asserts! (is-eq tx-sender (get contractor project)) ERR_UNAUTHORIZED)
+    (map-set work-sessions
+      { session-id: session-id }
+      {
+        project-id: project-id,
+        contractor: tx-sender,
+        task-description: task-description,
+        hourly-rate: (get rate-per-hour rate-info),
+        start-time: current-time,
+        end-time: none,
+        total-hours: none,
+        billable-amount: none,
+        status: "active",
+        approved-by: none,
+        created-at: current-time
+      }
+    )
+    (map-set contractor-sessions
+      { contractor: tx-sender, session-id: session-id }
+      { active: true }
+    )
+    (var-set next-work-session-id (+ session-id u1))
+    (ok session-id)
+  )
+)
+
+(define-public (end-work-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? work-sessions { session-id: session-id }) ERR_WORK_SESSION_NOT_FOUND))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (start-time (get start-time session))
+      (hourly-rate (get hourly-rate session))
+      (duration-seconds (- current-time start-time))
+      (duration-hours (/ duration-seconds u3600)) ;; Convert seconds to hours
+      (billable-amount (* duration-hours hourly-rate))
+    )
+    (asserts! (is-eq tx-sender (get contractor session)) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status session) "active") ERR_SESSION_ALREADY_ENDED)
+    (asserts! (is-none (get end-time session)) ERR_SESSION_ALREADY_ENDED)
+    (map-set work-sessions
+      { session-id: session-id }
+      (merge session {
+        end-time: (some current-time),
+        total-hours: (some duration-hours),
+        billable-amount: (some billable-amount),
+        status: "completed"
+      })
+    )
+    (ok {
+      duration-hours: duration-hours,
+      billable-amount: billable-amount
+    })
+  )
+)
+
+(define-public (approve-work-session (session-id uint))
+  (let
+    (
+      (session (unwrap! (map-get? work-sessions { session-id: session-id }) ERR_WORK_SESSION_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status session) "completed") ERR_INVALID_STATUS)
+    (map-set work-sessions
+      { session-id: session-id }
+      (merge session {
+        status: "approved",
+        approved-by: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (generate-time-invoice 
+  (project-id uint) 
+  (contractor principal)
+  (billing-period-start uint)
+  (billing-period-end uint)
+  (session-ids (list 10 uint))
+)
+  (let
+    (
+      (invoice-id (var-get next-invoice-id))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+      (total-calculations (calculate-invoice-totals session-ids))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (< billing-period-start billing-period-end) ERR_INVALID_TIME_ENTRY)
+    (map-set time-invoices
+      { invoice-id: invoice-id }
+      {
+        project-id: project-id,
+        contractor: contractor,
+        billing-period-start: billing-period-start,
+        billing-period-end: billing-period-end,
+        total-hours: (get total-hours total-calculations),
+        total-amount: (get total-amount total-calculations),
+        session-ids: session-ids,
+        status: "generated",
+        generated-at: current-time,
+        approved-at: none,
+        paid-at: none
+      }
+    )
+    (var-set next-invoice-id (+ invoice-id u1))
+    (ok invoice-id)
+  )
+)
+
+(define-public (approve-invoice (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? time-invoices { invoice-id: invoice-id }) ERR_INVOICE_NOT_FOUND))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status invoice) "generated") ERR_INVALID_STATUS)
+    (map-set time-invoices
+      { invoice-id: invoice-id }
+      (merge invoice {
+        status: "approved",
+        approved-at: (some current-time)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (mark-invoice-paid (invoice-id uint))
+  (let
+    (
+      (invoice (unwrap! (map-get? time-invoices { invoice-id: invoice-id }) ERR_INVOICE_NOT_FOUND))
+      (current-time (unwrap-panic (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status invoice) "approved") ERR_INVALID_STATUS)
+    (map-set time-invoices
+      { invoice-id: invoice-id }
+      (merge invoice {
+        status: "paid",
+        paid-at: (some current-time)
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Helper function to calculate invoice totals from session IDs
+(define-private (calculate-invoice-totals (session-ids (list 10 uint)))
+  (fold accumulate-session-totals session-ids { total-hours: u0, total-amount: u0 })
+)
+
+(define-private (accumulate-session-totals 
+  (session-id uint) 
+  (acc { total-hours: uint, total-amount: uint })
+)
+  (match (map-get? work-sessions { session-id: session-id })
+    session (if (is-eq (get status session) "approved")
+      {
+        total-hours: (+ (get total-hours acc) (default-to u0 (get total-hours session))),
+        total-amount: (+ (get total-amount acc) (default-to u0 (get billable-amount session)))
+      }
+      acc
+    )
+    acc
+  )
+)
+
+;; Read-only functions for time tracking data
+(define-read-only (get-work-session (session-id uint))
+  (map-get? work-sessions { session-id: session-id })
+)
+
+(define-read-only (get-project-hourly-rate (project-id uint) (contractor principal))
+  (map-get? project-hourly-rates { project-id: project-id, contractor: contractor })
+)
+
+(define-read-only (get-time-invoice (invoice-id uint))
+  (map-get? time-invoices { invoice-id: invoice-id })
+)
+
+(define-read-only (get-contractor-time-summary (contractor principal) (project-id uint))
+  (ok {
+    contractor: contractor,
+    project-id: project-id,
+    total-sessions: (get-contractor-session-count contractor project-id),
+    total-billable-hours: (get-contractor-billable-hours contractor project-id),
+    total-earnings: (get-contractor-earnings contractor project-id),
+    active-sessions: (get-contractor-active-sessions contractor)
+  })
+)
+
+(define-read-only (get-project-time-analytics (project-id uint))
+  (match (map-get? projects { project-id: project-id })
+    project (ok {
+      project-id: project-id,
+      total-logged-hours: (get-project-total-hours project-id),
+      total-labor-cost: (get-project-labor-cost project-id),
+      average-hourly-rate: (get-project-average-rate project-id),
+      active-sessions-count: (get-project-active-sessions project-id)
+    })
+    ERR_PROJECT_NOT_FOUND
+  )
+)
+
+;; Helper functions for analytics (simplified implementations)
+(define-private (get-contractor-session-count (contractor principal) (project-id uint))
+  u0 ;; Would implement session counting logic
+)
+
+(define-private (get-contractor-billable-hours (contractor principal) (project-id uint))
+  u0 ;; Would implement hours calculation logic
+)
+
+(define-private (get-contractor-earnings (contractor principal) (project-id uint))
+  u0 ;; Would implement earnings calculation logic
+)
+
+(define-private (get-contractor-active-sessions (contractor principal))
+  u0 ;; Would implement active session counting
+)
+
+(define-private (get-project-total-hours (project-id uint))
+  u0 ;; Would implement total hours calculation
+)
+
+(define-private (get-project-labor-cost (project-id uint))
+  u0 ;; Would implement cost calculation
+)
+
+(define-private (get-project-average-rate (project-id uint))
+  u0 ;; Would implement average rate calculation
+)
+
+(define-private (get-project-active-sessions (project-id uint))
+  u0 ;; Would implement active session counting
+)
+
+(define-read-only (get-next-work-session-id)
+  (var-get next-work-session-id)
+)
+
+(define-read-only (get-next-invoice-id)
+  (var-get next-invoice-id)
+)
+
+
